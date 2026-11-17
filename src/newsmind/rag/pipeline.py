@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any
 
 from newsmind.config import (
@@ -13,6 +13,7 @@ from newsmind.config import (
     RERANK_TOP_K,
     RETRIEVE_TOP_K,
 )
+from newsmind.rag.chunking import chunk_article
 from newsmind.rag.generate import answer_with_citations, format_context
 from newsmind.retrieve import (
     BM25Retriever,
@@ -75,7 +76,9 @@ class RAGSystem:
             }
         )
 
-        sparse_hits = self.hybrid.bm25.search(query, top_k=retrieve_k * 2)
+        # BM25 cost grows with query length, so it only sees the question; the
+        # article hint is used by the dense retriever, which handles long text cheaply.
+        sparse_hits = self.hybrid.bm25.search(question.strip(), top_k=retrieve_k * 2)
         dense_model = getattr(self, "dense_model", DENSE_MODEL)
         rerank_model = getattr(self, "rerank_model", RERANK_MODEL)
         alpha = float(getattr(self, "alpha", HYBRID_ALPHA))
@@ -128,7 +131,7 @@ class RAGSystem:
             }
         )
 
-        fused = self.hybrid.search(query, top_k=retrieve_k)
+        fused = self.hybrid.fuse(sparse_hits, dense_hits, top_k=retrieve_k)
         steps.append(
             {
                 "step": 4,
@@ -154,7 +157,7 @@ class RAGSystem:
         )
 
         if use_rerank and fused:
-            final_hits = self.reranker.rerank(query, fused, top_k=rerank_k)
+            final_hits = self.reranker.rerank(question.strip(), fused, top_k=rerank_k)
             steps.append(
                 {
                     "step": 5,
@@ -210,6 +213,61 @@ class RAGSystem:
             }
         )
         result["pipeline"] = steps
+        return result
+
+    def ask_article(
+        self,
+        question: str,
+        article: dict[str, Any],
+        *,
+        top_k: int = 3,
+    ) -> dict[str, Any]:
+        """Answer using only passages from the opened article (no corpus search)."""
+
+        chunks = chunk_article(
+            article_id=str(article.get("article_id") or "open"),
+            corpus=str(article.get("corpus") or ""),
+            outlet=str(article.get("outlet") or ""),
+            title=str(article.get("title") or ""),
+            text=str(article.get("text") or ""),
+            url=str(article.get("url") or ""),
+            size=500,
+            overlap=0,
+        )
+        hits = [Hit(index=i, score=0.0, meta=asdict(c)) for i, c in enumerate(chunks)]
+        final_hits = self.reranker.rerank(question.strip(), hits, top_k=top_k)
+        context = format_context(final_hits)
+        result = answer_with_citations(question, final_hits, self.generator_model)
+        result["pipeline"] = [
+            {
+                "step": 1,
+                "name": "Chunk the open article",
+                "detail": "Split only the opened article into short sentence-aware passages.",
+                "outputs": {"passages": len(chunks)},
+            },
+            {
+                "step": 2,
+                "name": f"Cross-encoder rerank ({self.rerank_model})",
+                "detail": "Score each (question, passage) pair and keep the best ones.",
+                "outputs": {
+                    "hits": [
+                        {
+                            "rank": i,
+                            "score": round(h.score, 4),
+                            "snippet": str(h.meta.get("text", ""))[:160],
+                        }
+                        for i, h in enumerate(final_hits, start=1)
+                    ]
+                },
+            },
+            {
+                "step": 3,
+                "name": f"Grounded generation ({self.generator_model})",
+                "detail": "FLAN-T5 answers using only the selected passages of this article.",
+                "inputs": {"model": self.generator_model, "context_chars": len(context)},
+                "outputs": {"answer": result["answer"]},
+            },
+        ]
         return result
 
     def retrieve_only(self, question: str, top_k: int = RETRIEVE_TOP_K) -> list[Hit]:

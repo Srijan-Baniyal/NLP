@@ -2,6 +2,13 @@
 
 from __future__ import annotations
 
+import os
+
+# FAISS and PyTorch each bundle an OpenMP runtime; on macOS they deadlock or abort
+# when both run multi-threaded. Must be set before either library is imported.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
 import json
 import pickle
 from pathlib import Path
@@ -22,6 +29,25 @@ from newsmind.eval.compare import compare_retrievers, compare_summarizers
 from newsmind.preprocess.syntax import analyze_syntax
 from newsmind.summarize import SUMMARIZER_MODES, summarize_traced
 from newsmind.topics import fit_lda
+
+
+@st.cache_resource
+def _start_preload() -> bool:
+    """Warm all abstractive models in the background once per server process."""
+    import threading
+
+    from newsmind.config import PEGASUS_MODEL, T5_MODEL
+    from newsmind.summarize import preload_models
+
+    threading.Thread(
+        target=preload_models,
+        args=((T5_MODEL, SUMMARIZER_MODEL, PEGASUS_MODEL),),
+        daemon=True,
+    ).start()
+    return True
+
+
+_start_preload()
 
 
 @st.cache_data(show_spinner="Loading corpus stats…")
@@ -261,16 +287,24 @@ def _render_article(row: pd.Series) -> None:
                 "What are the key facts in this article?",
                 key="article_question",
             )
-            use_article = st.checkbox("Ground retrieval with this article", value=True)
+            use_article = st.checkbox("Answer only from this article", value=True)
             use_rerank = st.checkbox("Use cross-encoder rerank", value=True)
             if st.button("Ask NewsMind", type="primary", key="do_ask") and question.strip():
                 with st.spinner("Running hybrid RAG pipeline…"):
-                    hint = body if use_article else None
-                    qa = rag.ask_traced(
-                        question,
-                        use_rerank=use_rerank,
-                        article_hint=hint,
-                    )
+                    if use_article:
+                        qa = rag.ask_article(
+                            question,
+                            {
+                                "article_id": row.get("article_id"),
+                                "corpus": row.get("corpus"),
+                                "outlet": row.get("outlet"),
+                                "title": title,
+                                "text": body,
+                                "url": url,
+                            },
+                        )
+                    else:
+                        qa = rag.ask_traced(question, use_rerank=use_rerank)
                     st.session_state.qa_result = qa
 
             qa = st.session_state.qa_result

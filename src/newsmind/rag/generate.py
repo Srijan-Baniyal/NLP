@@ -2,12 +2,20 @@
 
 from __future__ import annotations
 
+import re
 from functools import lru_cache
 from typing import Any
 
 import torch
 
+from newsmind.rag.chunking import split_sentences
 from newsmind.retrieve import Hit
+
+_STOP = frozenset(
+    "a an the is are was were be been of in on at to for and or with by from as that this "
+    "it its what who whom which when where why how did does do has have had about key facts "
+    "article story tell me".split()
+)
 
 
 @lru_cache(maxsize=1)
@@ -28,7 +36,7 @@ def _generate_text(prompt: str, model_name: str, max_new_tokens: int = 220) -> s
             **inputs,
             max_new_tokens=max_new_tokens,
             min_new_tokens=20,
-            num_beams=4,
+            num_beams=2,
             early_stopping=True,
         )
     return tokenizer.decode(output[0], skip_special_tokens=True).strip()
@@ -50,15 +58,54 @@ def format_context(hits: list[Hit], max_chars: int = 1800) -> str:
     return "\n".join(parts)
 
 
-def extractive_fallback(hits: list[Hit]) -> str:
-    lines: list[str] = []
-    for i, hit in enumerate(hits[:3], start=1):
-        outlet = str(hit.meta.get("outlet") or "source")
-        title = str(hit.meta.get("title") or "").strip()
-        text = str(hit.meta.get("text") or "").strip()
-        piece = title or text[:220]
-        lines.append(f"[{i}] ({outlet}) {piece}")
-    return "Based on the retrieved evidence:\n" + "\n".join(lines)
+def _words(text: str) -> list[str]:
+    return re.findall(r"[a-z0-9']+", text.lower())
+
+
+def _complete_sentences(text: str) -> str:
+    """Drop a trailing cut-off fragment so the answer ends on a full sentence."""
+    text = text.strip()
+    if not text or text[-1] in ".!?\"'”":
+        return text
+    cut = max(text.rfind(". "), text.rfind("! "), text.rfind("? "))
+    return text[: cut + 1].strip() if cut > 20 else text.rstrip(" ,;:") + "."
+
+
+def _is_copy(answer: str, context: str, n: int = 6) -> bool:
+    """True when the answer is mostly a verbatim slice of the retrieved context."""
+    words = _words(answer)
+    if len(words) < n:
+        return False
+    ctx = " ".join(_words(context))
+    grams = [" ".join(words[i : i + n]) for i in range(len(words) - n + 1)]
+    return sum(g in ctx for g in grams) / len(grams) > 0.6
+
+
+def clean_answer(answer: str, context: str = "") -> str:
+    """Strip echoed context headers, collapse whitespace, end on a full sentence."""
+    answer = re.sub(r"^\s*\[\d+\]\s*[^:\n]{0,60}:\s*(?:\.\s*)?", "", answer)
+    answer = re.sub(r"\s+", " ", answer).strip().lstrip(". ")
+    return _complete_sentences(answer)
+
+
+def extractive_fallback(hits: list[Hit], question: str = "") -> str:
+    """Pick the few most question-relevant complete sentences, each with its citation."""
+    q_terms = {w for w in _words(question) if w not in _STOP}
+    scored: list[tuple[float, int, int, str]] = []
+    for i, hit in enumerate(hits[:5], start=1):
+        text = str(hit.meta.get("text") or "")
+        for j, sent in enumerate(split_sentences(text[:1500])):
+            sent = sent.strip()
+            if len(sent) < 40:
+                continue
+            overlap = len(q_terms & set(_words(sent)))
+            scored.append((overlap - 0.05 * j - 0.1 * i, i, j, sent))
+    if not scored:
+        return "I could not find a clear answer in the retrieved evidence."
+    relevant = [t for t in scored if t[0] > 0]
+    top = sorted(relevant or scored, reverse=True)[:3]
+    top.sort(key=lambda t: (t[1], t[2]))
+    return " ".join(f"{_complete_sentences(s)} [{i}]" for _, i, _, s in top)
 
 
 def generate_answer(question: str, hits: list[Hit], model_name: str) -> str:
@@ -68,14 +115,19 @@ def generate_answer(question: str, hits: list[Hit], model_name: str) -> str:
     prompt = (
         f"Context: {context}\n\n"
         f"Question: {question}\n"
-        "Write a short answer using only the context. Include citation markers like [1]."
+        "Answer in one to three complete sentences, in your own words, using only the "
+        "context. Do not copy the context. End with citation markers like [1]."
     )
     try:
-        answer = _generate_text(prompt, model_name, max_new_tokens=160)
+        answer = clean_answer(_generate_text(prompt, model_name, max_new_tokens=160), context)
     except Exception:  # noqa: BLE001
-        return extractive_fallback(hits)
-    if len(answer) < 24 or answer.strip() in {"[1].", "[1]", "Yes.", "No."}:
-        return extractive_fallback(hits)
+        return extractive_fallback(hits, question)
+    if (
+        len(answer) < 24
+        or answer.strip() in {"[1].", "[1]", "Yes.", "No."}
+        or _is_copy(answer, context)
+    ):
+        return extractive_fallback(hits, question)
     return answer
 
 

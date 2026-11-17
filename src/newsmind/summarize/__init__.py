@@ -48,30 +48,68 @@ def extractive_textrank(text: str, sentence_count: int = 3) -> str:
     return " ".join(str(s) for s in sentences)
 
 
+def _device() -> str:
+    # MPS avoids the single-thread OpenMP limit set in app.py (needed for FAISS).
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+# Per-model generation settings: short, fast, and no repetition.
+_GEN_KWARGS: dict[str, dict[str, Any]] = {
+    PEGASUS_MODEL: {"max_new_tokens": 64, "min_new_tokens": 12},
+    T5_MODEL: {"max_new_tokens": 100, "min_new_tokens": 25},
+}
+_DEFAULT_GEN = {"max_new_tokens": 110, "min_new_tokens": 30}
+
+
 @lru_cache(maxsize=4)
-def _seq2seq(model_name: str) -> tuple[Any, Any]:
+def _seq2seq(model_name: str) -> tuple[Any, Any, str]:
     from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
     model.eval()
-    return tokenizer, model
+    device = _device()
+    try:
+        model.to(device)
+    except Exception:
+        device = "cpu"
+        model.to(device)
+    return tokenizer, model, device
+
+
+def preload_models(model_names: tuple[str, ...]) -> None:
+    """Load models and run a tiny warm-up so the first user click is fast."""
+    for name in model_names:
+        try:
+            abstractive_seq2seq("Warm up sentence for the model. " * 5, name)
+        except Exception:
+            pass
 
 
 def abstractive_seq2seq(
     text: str,
     model_name: str,
     *,
-    max_chars: int = 3000,
+    max_chars: int = 2000,
     prefix: str = "",
 ) -> str:
     if not text.strip():
         return ""
-    tokenizer, model = _seq2seq(model_name)
+    tokenizer, model, device = _seq2seq(model_name)
     clipped = (prefix + text[:max_chars]).strip()
-    inputs = tokenizer(clipped, return_tensors="pt", truncation=True, max_length=1024)
-    with torch.no_grad():
-        output = model.generate(**inputs, max_new_tokens=160, min_new_tokens=40)
+    inputs = tokenizer(clipped, return_tensors="pt", truncation=True, max_length=512)
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    gen = _GEN_KWARGS.get(model_name, _DEFAULT_GEN)
+    with torch.inference_mode():
+        output = model.generate(
+            **inputs,
+            **gen,
+            num_beams=2,
+            no_repeat_ngram_size=3,
+            early_stopping=True,
+        )
     return tokenizer.decode(output[0], skip_special_tokens=True).strip()
 
 

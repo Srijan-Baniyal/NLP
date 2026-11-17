@@ -117,6 +117,10 @@ class HybridRetriever:
     def search(self, query: str, top_k: int = 20) -> list[Hit]:
         sparse = self.bm25.search(query, top_k=top_k * 2)
         dens = self.dense.search(query, top_k=top_k * 2)
+        return self.fuse(sparse, dens, top_k=top_k)
+
+    def fuse(self, sparse: list[Hit], dens: list[Hit], top_k: int = 20) -> list[Hit]:
+        """Blend already-retrieved sparse and dense hits without searching again."""
         sparse_map = _minmax({h.index: h.score for h in sparse})
         dense_map = _minmax({h.index: h.score for h in dens})
         keys = set(sparse_map) | set(dense_map)
