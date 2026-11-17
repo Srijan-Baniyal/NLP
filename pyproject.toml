@@ -1,0 +1,61 @@
+[project]
+name = "newsmind"
+version = "0.1.0"
+description = "Retrieval-augmented summarization and QA for news articles"
+readme = "README.md"
+authors = [
+    { name = "Srijan Baniyal", email = "john.rambo.9901@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "accelerate>=1.15.0",
+    "datasets>=5.0.1",
+    "faiss-cpu>=1.15.1",
+    "feedparser>=6.0.14",
+    "gensim>=4.4.0",
+    "networkx>=3.7",
+    "nltk>=3.10.3",
+    "pandas>=3.0.6",
+    "pyarrow>=25.0.1",
+    "rank-bm25>=0.2.2",
+    "rouge-score>=0.1.2",
+    "scikit-learn>=1.9.1",
+    "sentence-transformers>=6.1.0",
+    "streamlit>=1.64.0",
+    "sumy>=0.13.0",
+    "torch>=2.14.0",
+    "transformers>=5.17.0",
+]
+
+[project.scripts]
+newsmind = "newsmind:main"
+newsmind-hf = "newsmind.ingest.hf_download:main"
+newsmind-rss = "newsmind.ingest.rss_ingest:main"
+newsmind-scale = "newsmind.ingest.scale_10m:main"
+newsmind-index = "newsmind.index.build:main"
+newsmind-outlets = "newsmind.ingest.outlet_archive:main"
+
+[build-system]
+requires = ["uv_build>=0.12.9,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "ruff>=0.16.9",
+    "ty>=0.0.84",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+exclude = [".venv", "data", "docs"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.ty.src]
+include = ["src"]
